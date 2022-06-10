@@ -75,8 +75,8 @@ def processTPI(dem: Union[str, arcpy.sa.Raster],
         tpi.save(out_tpi)
 
     arcpy.AddMessage('Deleting intermediate rasters..')
-    del focal_mean
     del dem
+    del focal_mean
 
     arcpy.AddMessage('PROCESS TPI RUN TIME: {} seconds'.format(time.perf_counter() - start))
 
@@ -108,7 +108,7 @@ def slopePosition(tpi: Union[str, arcpy.sa.Raster], slope:  Union[str, arcpy.sa.
     arcpy.CheckOutExtension('Spatial')
 
     # If input TPI and slope are not already raster objects, cast as rasters
-    if slope != arcpy.sa.Raster:
+    if tpi != arcpy.sa.Raster:
         tpi = arcpy.Raster(tpi)
     if slope != arcpy.sa.Raster:
         slope = arcpy.Raster(slope)
@@ -154,3 +154,106 @@ def slopePosition(tpi: Union[str, arcpy.sa.Raster], slope:  Union[str, arcpy.sa.
     arcpy.AddMessage('SLOPE POSITION RUN TIME: {} seconds'.format(time.perf_counter() - start))
 
     return tpislope
+
+
+def landform(tpi_small_scale: Union[str, arcpy.sa.Raster], tpi_large_scale: Union[str, arcpy.sa.Raster],
+             slope: Union[str, arcpy.sa.Raster],
+             stdev_thres: int, slope_thres: int,
+             out_landform: str = None, mask: str = None) -> arcpy.sa.Raster:
+    """
+    Function to process landform from topographic position index (TPI) rasters.
+    Requires two TPI rasters at different scales (e.g. 300 meter and 2000 meter)
+    If a path to the output slope position raster is provided, the output slope position will saved to drive.
+    A mask may be provided to limit the analysis are to within provided mask.
+    Implementation of methods described in Weiss, Topographic Position and Landforms Analysis, The Nature Conservancy.
+    http://www.jennessent.com/downloads/tpi-poster-tnc_18x22.pdf
+
+    :param tpi_small_scale: Path to small scale topographic position index (TPI) raster or arcpy.sa.Raster object of TPI
+    :param tpi_large_scale: Path to large scale topographic position index (TPI) raster or arcpy.sa.Raster object of TPI
+    :param slope: Path to slope raster or arcpy.sa.Raster object of slope
+    :param stdev_thres: Standard deviation threshold for landform classification
+    :param slope_thres: Slope threshold for landform classification
+    :param out_landform: Path to output slope position raster. If provided, slope position will be saved to drive.
+    :param mask: Path to mask feature class or raster
+    :return: Output landform processed raster
+    """
+
+    start = time.perf_counter()
+
+    arcpy.CheckOutExtension('Spatial')
+
+    # If input TPI and slope are not already raster objects, cast as rasters
+    if tpi_small_scale != arcpy.sa.Raster:
+        tpi_small_scale = arcpy.Raster(tpi_small_scale)
+    if tpi_large_scale != arcpy.sa.Raster:
+        tpi_large_scale = arcpy.Raster(tpi_large_scale)
+    if slope != arcpy.sa.Raster:
+        slope = arcpy.Raster(slope)
+
+    if mask:
+        arcpy.AddMessage('Setting mask environment..')
+        arcpy.env.mask = mask
+        tpi_small_scale = arcpy.sa.ExtractByMask(tpi_small_scale, mask)
+        arcpy.CalculateStatistics_management(tpi_small_scale)
+        tpi_large_scale = arcpy.sa.ExtractByMask(tpi_large_scale, mask)
+        arcpy.CalculateStatistics_management(tpi_large_scale)
+        slope = arcpy.sa.ExtractByMask(slope, mask)
+        arcpy.CalculateStatistics_management(slope)
+
+    arcpy.AddMessage('Gathering TPI raster stats..')
+    mean_small_scale = tpi_small_scale.mean
+    sd_small_scale = tpi_small_scale.standardDeviation
+    mean_large_scale = tpi_large_scale.mean
+    sd_large_scale = tpi_large_scale.standardDeviation
+
+    arcpy.AddMessage('Scaling small scale TPI raster..')
+    tpi_small_scale_z = (tpi_small_scale - mean_small_scale) / sd_small_scale
+
+    arcpy.AddMessage('Scaling large scale TPI raster..')
+    tpi_large_scale_z = (tpi_large_scale - mean_large_scale) / sd_large_scale
+
+    arcpy.AddMessage('Reclassifying TPI rasters..')
+    tpi_small_scale_zr = arcpy.sa.Reclassify(tpi_small_scale_z, 'VALUE', arcpy.sa.RemapRange([[tpi_small_scale_z.minimum, -stdev_thres, -1],
+                                                                                              [-stdev_thres, stdev_thres, 0],
+                                                                                              [stdev_thres, tpi_small_scale_z.maximum, 1]]))
+    tpi_large_scale_zr = arcpy.sa.Reclassify(tpi_large_scale_z, 'VALUE', arcpy.sa.RemapRange([[tpi_large_scale_z.minimum, -stdev_thres, -1000],
+                                                                                              [-stdev_thres, stdev_thres, 0],
+                                                                                              [stdev_thres, tpi_large_scale_z.maximum, 1000]]))
+    arcpy.AddMessage('Adding reclassified TPI..')
+    reclassadd = tpi_small_scale_zr + tpi_large_scale_zr
+
+    arcpy.AddMessage('Reclassifying slope..')
+    slope_r = Con(reclassadd == 0, Con(slope > slope_thres, 10, 0), 0)
+
+    arcpy.AddMessage('Adding reclassified slope to reclassified TPI..')
+    tpilandform = reclassadd + slope_r
+
+    arcpy.AddMessage('Reclassifying final TPI landforms..')
+    tpilandform_r = arcpy.sa.Reclassify(tpilandform, 'VALUE', arcpy.sa.RemapValue([[-1001, 1],
+                                                                                   [-1000, 4],
+                                                                                   [-999, 8],
+                                                                                   [-1, 2],
+                                                                                   [0, 5],
+                                                                                   [1, 9],
+                                                                                   [10, 6],
+                                                                                   [999, 3],
+                                                                                   [1000, 7],
+                                                                                   [1001, 10]]))
+    if out_landform:
+        arcpy.AddMessage('Saving TPI Landform raster..')
+        tpilandform_r.save(out_landform)
+
+    arcpy.AddMessage('Deleting intermediate rasters..')
+    del tpi_small_scale
+    del tpi_large_scale
+    del slope
+    del tpi_small_scale_z
+    del tpi_large_scale_z
+    del tpi tpi_small_scale_zr
+    del tpi_large_scale_zr
+    del reclassadd
+    del slope_rdel tpilandform
+
+    arcpy.AddMessage('RUN TIME: {} seconds'.format(time.perf_counter() - start))
+
+    return tpilandform_r
